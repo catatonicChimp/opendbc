@@ -1,10 +1,13 @@
 import random
 import re
 import unittest
+from types import SimpleNamespace
 
-from opendbc.car import DT_CTRL
+from opendbc.car import DT_CTRL, structs
 from opendbc.car.structs import CarParams
 from opendbc.car.volkswagen.carcontroller import HCAMitigation
+from opendbc.car.volkswagen.carstate import CarState
+from opendbc.car.volkswagen.interface import CarInterface
 from opendbc.car.volkswagen.values import CAR, CarControllerParams as CCP, FW_QUERY_CONFIG, WMI
 from opendbc.car.volkswagen.fingerprints import FW_VERSIONS
 
@@ -75,3 +78,29 @@ class TestVolkswagenPlatformConfigs(unittest.TestCase):
 
               expected_matches = {platform} if should_match else set()
               assert expected_matches == matches, "Bad match"
+
+
+class TestVolkswagenMqbMainSwitchCancel(unittest.TestCase):
+  @staticmethod
+  def _cancel_events(frames, alpha_long=True):
+    CP = CarInterface.get_params(CAR.VOLKSWAGEN_GOLF_MK7, {bus: {} for bus in range(8)}, [], alpha_long, False, False)
+    buttons = CCP(CP).BUTTONS
+    CS = CarState.__new__(CarState)
+    CS.button_states = {button.event_type: False for button in buttons}
+    released = ("GRA_Tip_Setzen", "GRA_Tip_Wiederaufnahme", "GRA_Tip_Hoch", "GRA_Tip_Runter", "GRA_Verstellung_Zeitluecke")
+    events = []
+    for abbrechen, hauptschalter in frames:
+      gra = dict.fromkeys(released, 0) | {"GRA_Abbrechen": abbrechen, "GRA_Hauptschalter": hauptschalter}
+      button_events = CS.create_button_events(SimpleNamespace(vl={"GRA_ACC_01": gra}), buttons)
+      events.append([be.pressed for be in button_events if be.type == structs.CarState.ButtonEvent.Type.cancel])
+    return events
+
+  def test_main_switch_cancels_under_openpilot_long(self):
+    # Some MFL wheels have no cancel button, and nothing else acts on O/I under openpilot long
+    self.assertEqual(self._cancel_events([(0, 0), (0, 1), (0, 1), (0, 0)]), [[], [True], [], [False]])
+
+  def test_overlapping_cancel_signals_are_one_press(self):
+    self.assertEqual(self._cancel_events([(1, 0), (1, 1), (0, 1), (0, 0)]), [[True], [], [], [False]])
+
+  def test_main_switch_untouched_with_stock_long(self):
+    self.assertEqual(self._cancel_events([(0, 0), (0, 1), (0, 0)], alpha_long=False), [[], [], []])
