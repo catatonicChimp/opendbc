@@ -1,11 +1,14 @@
 import random
 import re
 import unittest
+from types import SimpleNamespace
 
-from opendbc.car import DT_CTRL
+from opendbc.can import CANPacker
+from opendbc.car import Bus, DT_CTRL
 from opendbc.car.structs import CarParams
+from opendbc.car.volkswagen import mqbcan
 from opendbc.car.volkswagen.carcontroller import HCAMitigation
-from opendbc.car.volkswagen.values import CAR, CarControllerParams as CCP, FW_QUERY_CONFIG, WMI
+from opendbc.car.volkswagen.values import CAR, DBC, CarControllerParams as CCP, FW_QUERY_CONFIG, WMI
 from opendbc.car.volkswagen.fingerprints import FW_VERSIONS
 
 Ecu = CarParams.Ecu
@@ -75,3 +78,28 @@ class TestVolkswagenPlatformConfigs(unittest.TestCase):
 
               expected_matches = {platform} if should_match else set()
               assert expected_matches == matches, "Bad match"
+
+
+def _field(data, start, size):
+  return (int.from_bytes(bytes(data), 'little') >> start) & ((1 << size) - 1)
+
+
+class TestVolkswagenMqbKMatrix(unittest.TestCase):
+  def test_stalk_fields_copied_at_vw_positions(self):
+    # VW GRA_ACC_01: limiter button 25, tip stage 2 at 26, stalk type 27|3, Travel Assist button 30
+    packer = CANPacker(DBC[CAR.VOLKSWAGEN_GOLF_MK7][Bus.pt])
+    stock = {"GRA_Hauptschalter": 1, "GRA_Typ_Hauptschalter": 0, "GRA_Codierung": 2, "GRA_LIM_Taste_verfuegbar": 1,
+             "GRA_Tip_Stufe_2": 1, "GRA_ButtonTypeInfo": 6, "GRA_TravelAssist": 1, "COUNTER": 4}
+    data = mqbcan.create_acc_buttons_control(packer, 0, stock, resume=True)[1]
+    self.assertEqual([_field(data, 25, 1), _field(data, 26, 1), _field(data, 27, 3), _field(data, 30, 1)], [1, 1, 6, 1])
+    self.assertEqual(_field(data, 8, 4), 5)   # counter follows the stock frame
+    self.assertEqual(_field(data, 19, 1), 1)  # resume
+    self.assertEqual(_field(data, 13, 1), 0)  # cancel
+    self.assertEqual(_field(data, 16, 1), 0)  # set
+
+  def test_ldw_passes_through_early_late_setting(self):
+    packer = CANPacker(DBC[CAR.VOLKSWAGEN_GOLF_MK7][Bus.pt])
+    stock = {"LDW_Frueh_Spaet": 2, "LDW_Seite_DLCTLC": 1, "LDW_DLC": 0.5, "LDW_TLC": 1.2}
+    hud = SimpleNamespace(leftLaneDepart=False, rightLaneDepart=False, leftLaneVisible=True, rightLaneVisible=True)
+    data = mqbcan.create_lka_hud_control(packer, 0, stock, True, False, 0, hud)[1]
+    self.assertEqual(_field(data, 14, 2), 2)
