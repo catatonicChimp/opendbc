@@ -88,8 +88,10 @@ class TestVolkswagenMqbGasOverride(unittest.TestCase):
     statuses = []
     for enabled, long_active, gas_pressed in frames:
       CC = structs.CarControl(enabled=enabled, longActive=long_active)
-      controller.update_gas_override(SimpleNamespace(out=SimpleNamespace(gasPressed=gas_pressed)), CC)
-      statuses.append(mqbcan.acc_control_value(True, False, CC.longActive, controller.gas_override))
+      CS = SimpleNamespace(out=SimpleNamespace(gasPressed=gas_pressed, accFaulted=False, cruiseState=SimpleNamespace(available=True)))
+      controller.update_gas_override(CS, CC)
+      long_active = CC.longActive and not controller.gas_override and controller.gas_override_standdown == 0
+      statuses.append(mqbcan.acc_control_value(True, False, long_active, controller.gas_override))
     return statuses
 
   def test_gas_release_has_no_standby_frame(self):
@@ -103,7 +105,7 @@ class TestVolkswagenMqbGasOverride(unittest.TestCase):
       (True, False, False),  # gas released, longActive not yet updated
       (True, True, False),   # engaged again
     ]
-    self.assertEqual(self._acc_status_sequence(frames), [3, 3, 4, 4, 4, 3])
+    self.assertEqual(self._acc_status_sequence(frames), [3, 4, 4, 4, 4, 3])
 
   def test_override_requires_gas(self):
     # Long paused for reasons other than the gas pedal is not an override
@@ -111,3 +113,37 @@ class TestVolkswagenMqbGasOverride(unittest.TestCase):
 
   def test_override_ends_on_disengage(self):
     self.assertEqual(self._acc_status_sequence([(True, False, True), (False, False, False), (False, False, True)]), [4, 2, 2])
+
+  def test_override_clears_when_faulted_or_unavailable(self):
+    CP = CarInterface.get_params(CAR.VOLKSWAGEN_GOLF_MK7, {bus: {} for bus in range(8)}, [], True, False, False)
+    for faulted, available in [(True, True), (False, False)]:
+      controller = CarController(DBC[CP.carFingerprint], CP)
+      controller.gas_override = True
+      CS = SimpleNamespace(out=SimpleNamespace(gasPressed=True, accFaulted=faulted, cruiseState=SimpleNamespace(available=available)))
+      controller.update_gas_override(CS, structs.CarControl(enabled=True, longActive=False))
+      self.assertFalse(controller.gas_override)
+
+  def test_override_release_is_bounded(self):
+    # Safety allows zero accel without gas, so the latch must expire on its own when control never resumes
+    CP = CarInterface.get_params(CAR.VOLKSWAGEN_GOLF_MK7, {bus: {} for bus in range(8)}, [], True, False, False)
+    controller = CarController(DBC[CP.carFingerprint], CP)
+    hold = controller.gas_override_hold_updates
+    standdown = controller.gas_override_standdown_updates
+    frames = [(True, True, False), (True, True, True), (True, False, True)]
+    frames += [(True, False, False)] * hold
+    self.assertEqual(self._acc_status_sequence(frames)[-hold:], [4] * hold)
+    # One more release update without longActive returns stands down to standby
+    frames += [(True, False, False)]
+    self.assertEqual(self._acc_status_sequence(frames)[-1], 2)
+    # Control resuming immediately must not jump straight back to active inside the fault window
+    frames += [(True, True, False)] * (standdown - 1)
+    self.assertEqual(self._acc_status_sequence(frames)[-standdown + 1:], [2] * (standdown - 1))
+    frames += [(True, True, False)]
+    self.assertEqual(self._acc_status_sequence(frames)[-1], 3)
+
+  def test_gas_press_during_standdown_reenters_override(self):
+    CP = CarInterface.get_params(CAR.VOLKSWAGEN_GOLF_MK7, {bus: {} for bus in range(8)}, [], True, False, False)
+    hold = CarController(DBC[CP.carFingerprint], CP).gas_override_hold_updates
+    frames = [(True, True, True), (True, False, True)] + [(True, False, False)] * (hold + 1)
+    frames += [(True, False, True)]
+    self.assertEqual(self._acc_status_sequence(frames)[-1], 4)
