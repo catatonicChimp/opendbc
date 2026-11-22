@@ -60,6 +60,15 @@ class CarController(CarControllerBase):
     self.gra_acc_counter_last = None
     self.hca_mitigation = HCAMitigation(self.CCP)
     self.gas_override = False
+    self.gas_override_hold = 0
+    self.gas_override_standdown = 0
+    # ACC_06/ACC_07 are sent every ACC_CONTROL_STEP updates (50 Hz). Hold the override for two message
+    # periods after pedal release: CarState reaches the controller before controlsd's longActive catches up,
+    # and one ACC_STANDBY frame between override and active latches a TSK_06 fault.
+    self.gas_override_hold_updates = self.CCP.ACC_CONTROL_STEP * 2
+    # If control still hasn't resumed, stand down to standby for three message periods before allowing
+    # active again, so override -> standby -> active can't happen inside the ECU's fault window.
+    self.gas_override_standdown_updates = self.CCP.ACC_CONTROL_STEP * 3
 
   def update_gas_override(self, CS, CC):
     # Engaged, but longitudinal is released to the driver's gas pedal. MQB only: panda safety permits the
@@ -67,7 +76,29 @@ class CarController(CarControllerBase):
     # Hold override until longActive returns: longActive lags gasPressed by a frame on release, and a single
     # frame of ACC_STANDBY between ACC_OVERRIDE and ACC_ACTIVE drops TSK_06 to standby, which then latches
     # a fault 0.5s later when we keep sending ACC_ACTIVE.
-    self.gas_override = self.CCS == mqbcan and CC.enabled and not CC.longActive and (CS.out.gasPressed or self.gas_override)
+    eligible = (self.CCS == mqbcan and self.CP.openpilotLongitudinalControl and CC.enabled and
+                CS.out.cruiseState.available and not CS.out.accFaulted)
+    if not eligible:
+      self.gas_override = False
+      self.gas_override_hold = 0
+      self.gas_override_standdown = 0
+    elif CS.out.gasPressed:
+      self.gas_override = True
+      self.gas_override_hold = 0
+      self.gas_override_standdown = 0
+    elif self.gas_override and not CC.longActive:
+      # Pedal released: bridge the lag until longActive returns, but bounded. Safety permits zero
+      # acceleration without gas, so an unbounded latch would keep ACC_OVERRIDE engaged indefinitely.
+      if self.gas_override_hold < self.gas_override_hold_updates:
+        self.gas_override_hold += 1
+      else:
+        self.gas_override = False
+        self.gas_override_standdown = self.gas_override_standdown_updates
+    elif self.gas_override_standdown > 0:
+      self.gas_override = False
+      self.gas_override_standdown -= 1
+    else:
+      self.gas_override = False
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
@@ -154,13 +185,14 @@ class CarController(CarControllerBase):
                                                            CS.out.vEgoRaw * CV.MS_TO_KPH, CS.travel_assist_available))
 
         else:
-          stopping = actuators.longControlState == LongCtrlState.stopping
-          acc_control = self.CCS.acc_control_value(CS.out.cruiseState.available, CS.out.accFaulted, CC.longActive,
+          long_active = CC.longActive and not self.gas_override and self.gas_override_standdown == 0
+          stopping = long_active and actuators.longControlState == LongCtrlState.stopping
+          acc_control = self.CCS.acc_control_value(CS.out.cruiseState.available, CS.out.accFaulted, long_active,
                                                    self.gas_override)
           # Zero when not active: also the only request besides inactive that panda allows during gas override
-          accel = float(np.clip(actuators.accel, self.CCP.ACCEL_MIN, self.CCP.ACCEL_MAX) if CC.longActive else 0)
-          starting = actuators.longControlState == LongCtrlState.pid and (CS.esp_hold_confirmation or CS.out.vEgo < 0.25)
-          can_sends.extend(self.CCS.create_acc_accel_control(self.packer_pt, self.CAN.pt, CS.acc_type, CC.longActive, accel,
+          accel = float(np.clip(actuators.accel, self.CCP.ACCEL_MIN, self.CCP.ACCEL_MAX) if long_active else 0)
+          starting = long_active and actuators.longControlState == LongCtrlState.pid and (CS.esp_hold_confirmation or CS.out.vEgo < 0.25)
+          can_sends.extend(self.CCS.create_acc_accel_control(self.packer_pt, self.CAN.pt, CS.acc_type, long_active, accel,
                                                              acc_control, stopping, starting, CS.esp_hold_confirmation))
 
         self.accel_last = accel
@@ -198,7 +230,8 @@ class CarController(CarControllerBase):
         lead_distance = 0
         if hud_control.leadVisible and self.frame * DT_CTRL > 1.0:  # Don't display lead until we know the scaling factor
           lead_distance = 512 if CS.upscale_lead_car_signal else 8
-        acc_hud_status = self.CCS.acc_hud_status_value(CS.out.cruiseState.available, CS.out.accFaulted, CC.longActive,
+        acc_hud_status = self.CCS.acc_hud_status_value(CS.out.cruiseState.available, CS.out.accFaulted,
+                                                       CC.longActive and not self.gas_override and self.gas_override_standdown == 0,
                                                        self.gas_override)
         # FIXME: PQ may need to use the on-the-wire mph/kmh toggle to fix rounding errors
         # FIXME: Detect clusters with vEgoCluster offsets and apply an identical vCruiseCluster offset
